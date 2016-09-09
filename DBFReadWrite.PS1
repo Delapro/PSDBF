@@ -158,6 +158,15 @@ function Get-DBFStructure () {
 }
 
 # returns integer from byte array
+function Bin2Int16BE ()    
+{
+  [CmdletBinding()]
+  #TODO: set OutputType to UINT16
+  param([System.Byte[]] $Bytes)
+  return $Bytes[1]+$Bytes[0]*256  #attenteion BIG ENDIAN
+}
+
+# returns integer from byte array
 function Bin2Int32 ()    
 {
   [CmdletBinding()]
@@ -179,6 +188,22 @@ function Int322Bin ()
     $NumTemp[1] = [Math]::Floor($Rest/(256))
     $Rest = $Value % 256
     $NumTemp[0] = $Rest
+    return $NumTemp
+}
+
+# returns byte array from integer
+function Int322BinBE ()
+{
+    [CmdletBinding()]
+    Param([UInt32]$Value)
+    [System.Byte[]]$NumTemp=@(0x00)*4
+    $NumTemp[0] = [Math]::Floor($Value/(256*256*256))
+    $Rest = $Value % (256*256*256)
+    $NumTemp[1] = [Math]::Floor($Rest/(256*256))
+    $Rest = $Value % (256*256)
+    $NumTemp[2] = [Math]::Floor($Rest/(256))
+    $Rest = $Value % 256
+    $NumTemp[3] = $Rest
     return $NumTemp
 }
 
@@ -221,6 +246,9 @@ function Use-DBF () {
     
     foreach ($field in $DBFInfo.Header.Fields)
     {
+        # TODO: every field should get its own getter and setter function:
+        # $DBFInfo.Fields | Add-Member -MemberType ScriptProperty -Name "Fieldname" -Value {$this.Fieldbuffer[Fieldname]} -SecondValue {Param($Value);$Value;$this.Fieldbuffer[Fieldname]=$Value}
+        # there should also be a dirty flag if a field has changed 
         $DBFInfo.Fields[$field.Name] = "val"  # TODO: check val, better empty
     }
     
@@ -250,6 +278,7 @@ function Use-DBF () {
     $DBFInfo
 }
 
+# Standalone ZAP
 function Zap_DBF () {
     [CmdletBinding()]
     param( 
@@ -259,8 +288,9 @@ function Zap_DBF () {
         [string]$DBFFilename
          )
 
-    [System.Byte[]]$Numtemp=@()
+    [System.Byte[]]$Numtemp=@() # important to set the type!
 
+    $Type = Test-DBF $DBFFilename
     $Header = Get-DBFStructure $DBFFilename
 
     $DBFFileHandle = [System.IO.File]::Open($DBFFilename,
@@ -290,7 +320,43 @@ function Zap_DBF () {
 
     $DBFFileHandle.Close()
 
-    # TODO: Memofield handling!
+    if ($Type.hasMemoFile)
+    {
+        switch($Type.memoExt) {
+            "DBT"   {throw "not yet implemented! DBT"}
+            "FPT"   {   $FPTFile = [System.IO.Path]::ChangeExtension($DBFFilename, $Type.MemoExt)
+                        $FPTFileHandle = [System.IO.File]::Open($FptFile,
+                                        [System.IO.FileMode]::Open,
+                                        [System.IO.FileAccess]::ReadWrite,
+                                        [System.IO.FileShare]::ReadWrite)
+                        $NumTemp = @(0x00)*2
+                        $Position = $FPTFileHandle.Seek(6, [System.IO.SeekOrigin]::Begin)
+                        $BytesRead = $FPTFileHandle.Read($NumTemp, 0, 2)
+                        $BlockSize = Bin2Int16BE $Numtemp
+
+                        $HeaderSize = 512 
+                        # Check if Flexfile3 is there!
+                        $Flexfile3ID = "FlexFile3"
+                        $NumTemp = @(0x00)*$Flexfile3ID.Length
+                        $Position = $FPTFileHandle.Seek($HeaderSize, [System.IO.SeekOrigin]::Begin)
+                        $BytesRead = $FPTFileHandle.Read($NumTemp, 0, $Flexfile3ID.Length)
+                        If (([System.Text.Encoding]::ASCII.GetString($Numtemp)) -eq $Flexfile3ID) {
+                            $HeaderSize = 1024
+                        } 
+
+                        $NextBlock = $HeaderSize / $BlockSize
+                        # set next available Block
+                        $Position = $FPTFileHandle.Seek(0, [System.IO.SeekOrigin]::Begin)
+                        $Numtemp = Int322BinBE $NextBlock
+                        $FPTFileHandle.Write($Numtemp, 0, 4)
+
+                        $Position = $FPTFileHandle.Seek($HeaderSize, [System.IO.SeekOrigin]::Begin)
+                        $FPTFileHandle.SetLength($Position)
+                        $FPTFileHandle.Close()
+            }
+            default {throw "not yet implemented! $($Type.memoExt)"}
+        }
+    }
 }
 
 # should be internal functions
@@ -701,4 +767,4 @@ function _Reset-MemofieldPointerFPT ($DBFInfo, $FieldPos)
 #
 #
 
-Zap_DBF C:\temp\PSDBFTest\temp\preisart.dbf
+Zap_DBF C:\temp\PSDBFTest\temp\test.dbf
