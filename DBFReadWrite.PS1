@@ -538,7 +538,7 @@ function _Get-MemofieldData ($DBFInfo, $Fieldname)
     {
         if ($DBFInfo.FileHandleOfMemo)
         {        
-            $FieldPos = $DBFInfo.Header.Fields | where {$_.Name -eq $Fieldname}
+            $FieldPos = $DBFInfo.Header.Fields | Where-Object {$_.Name -eq $Fieldname}
             if ($FieldPos)
             {
                 if ($DBFInfo.Type.memoExt -eq "DBT")
@@ -625,7 +625,7 @@ function _Check-MemofieldIntegrity ($DBFInfo)
     {
         if ($DBFInfo.FileHandleOfMemo)
         {
-            $FieldPos = $DBFInfo.Header.Fields | where {$_.Type -eq "M"}
+            $FieldPos = $DBFInfo.Header.Fields | Where-Object {$_.Type -eq "M"}
             foreach ($fp in $FieldPos)
             {                
                 if ($DBFInfo.Type.memoExt -eq "DBT")
@@ -702,7 +702,7 @@ function _Reset-MemofieldPointer ($DBFInfo, $FieldName)
     {
         if ($DBFInfo.FileHandleOfMemo)
         {
-            $FieldPos = $DBFInfo.Header.Fields | where {$_.Type -eq "M" -and $_.Name -eq $FieldName}
+            $FieldPos = $DBFInfo.Header.Fields | Where-Object {$_.Type -eq "M" -and $_.Name -eq $FieldName}
             foreach ($fp in $FieldPos)
             {                
                 if ($DBFInfo.Type.memoExt -eq "DBT")
