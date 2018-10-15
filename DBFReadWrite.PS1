@@ -163,7 +163,7 @@ function Bin2Int16BE ()
   [CmdletBinding()]
   #TODO: set OutputType to UINT16
   param([System.Byte[]] $Bytes)
-  return $Bytes[1]+$Bytes[0]*256  #attenteion BIG ENDIAN
+  return $Bytes[1]+$Bytes[0]*256  #attention BIG ENDIAN
 }
 
 # returns integer from byte array
@@ -758,7 +758,7 @@ function _Reset-MemofieldPointerFPT ($DBFInfo, $FieldPos)
 # foreach($nr in $b.ListAll()) {$b.Goto($nr); _Check-MemofieldIntegrity $b }
 
 # clear all mispointing memofields
-# $b = Use-DBF I:\delapro\kunden\biesinge\artikel.dbf -ReadWrite                                                            
+# $b = Use-DBF .\artikel.dbf -ReadWrite                                                            
 # $bk = foreach($nr in $b.ListAll()) {$b.Goto($nr); _Check-MemofieldIntegrity $b }                                          
 # foreach ($r in $bk) {$b.GoTo($r.recno); _Reset-MemofieldPointer $b $r.FieldPos.Name}                                      
 # $bkN = foreach($nr in $b.ListAll()) {$b.Goto($nr); _Check-MemofieldIntegrity $b }                                         
