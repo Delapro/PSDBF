@@ -757,9 +757,10 @@ function _Reset-MemofieldPointerFPT ($DBFInfo, $FieldPos)
 # checks memofield-integrity:
 # foreach($nr in $b.ListAll()) {$b.Goto($nr); _Check-MemofieldIntegrity $b }
 
-# clear all mispointing memofields
-# $b = Use-DBF .\artikel.dbf -ReadWrite                                                            
-# $bk = foreach($nr in $b.ListAll()) {$b.Goto($nr); _Check-MemofieldIntegrity $b }                                          
+# clear all mispointing memofields, handles multiple memofields
+# $b = Use-DBF (Resolve-Path .\artikel.dbf) -ReadWrite                                                            
+# $bk = foreach($nr in $b.ListAll()) {$b.Goto($nr); _Check-MemofieldIntegrity $b }
+# # $bk now holds a special structure of memofields to be repaired
 # foreach ($r in $bk) {$b.GoTo($r.recno); _Reset-MemofieldPointer $b $r.FieldPos.Name}                                      
 # $bkN = foreach($nr in $b.ListAll()) {$b.Goto($nr); _Check-MemofieldIntegrity $b }                                         
 # $bkN.Length                                                                                                               
