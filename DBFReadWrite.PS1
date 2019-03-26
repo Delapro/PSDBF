@@ -453,11 +453,6 @@ function _ListAll ($DBFInfo)
     1..$DBFInfo.Header.NumRecords
 }
 
-function _ListAll ($DBFInfo)
-{
-    1..$DBFInfo.Header.NumRecords
-}
-
 # refreshes the current fieldvalues in the fields hashset
 function _ReadRecord ($DBFInfo, $recNo)
 {
