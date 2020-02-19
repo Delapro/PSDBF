@@ -763,4 +763,4 @@ function _Reset-MemofieldPointerFPT ($DBFInfo, $FieldPos)
 #
 #
 
-Zap_DBF C:\temp\PSDBFTest\temp\test.dbf
+# Zap_DBF C:\temp\PSDBFTest\temp\test.dbf
