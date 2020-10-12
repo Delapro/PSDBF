@@ -17,21 +17,7 @@ function Test-DBF {
                                             [System.IO.FileAccess]::Read,
                                             [System.IO.FileShare]::ReadWrite)
     $DBFType = $DBFFileHandle.ReadByte()
-    $DBFObject = New-Object PSObject
-    $DBFObject | Add-Member -Type NoteProperty -Name ID -Value 0
-    $DBFObject | Add-Member -Type NoteProperty -Name Type -Value ""
-    $DBFObject | Add-Member -Type NoteProperty -Name hasMemoFile -Value $false
-    $DBFObject | Add-Member -Type NoteProperty -Name memoExt -Value "DBT"
-    $DBFObject | Add-Member -Type NoteProperty -Name memoBlockSize -Value 512     # DBT Blocksize is always 512Bytes
-    $DBFObject.ID = $DBFType
-    switch ($DBFType)
-    {
-        3 {$DBFObject.Type = "DBF-file"}
-        131 {$DBFObject.Type = "DBF+DBT-files"; $DBFObject.hasMemoFile = $true}
-        139 {$DBFObject.Type = "DBF(dBase IV)+DBT-files"; $DBFObject.hasMemoFile = $true}
-        245 {$DBFObject.Type = "DBF+FPT-files"; $DBFObject.hasMemoFile = $true; $DBFObject.memoExt = "FPT"}
-        default {$DBFObject.Type = "unknown"}
-    }
+    $DBFObject = _NewDBFObject -DbfType $DBFType
     $DBFFileHandle.Close()
     
     # determining memofield blocksize when FPT-memos
@@ -75,6 +61,7 @@ function Get-DBFStructure () {
     $DBFStructure | Add-Member -Type NoteProperty -Name NumFields -Value 0
     #$DBFStructure | Add-Member -Type NoteProperty -Name Fields -Value []$DBFFields
     $DBFStructure | Add-Member -Type NoteProperty -Name Fields -Value @()
+    $DBFStructure | Add-Member -Type NoteProperty -Name Encoding -Value @()
 
     # PropertySet: http://mow001.blogspot.de/2006/01/some-fun-with-monads-add-member-mp3.html
     # to ask for propertySet use select from the returned object: $x | select HeaderInfo
@@ -111,6 +98,11 @@ function Get-DBFStructure () {
     $Day=$NumTemp[2]
     $DBFStructure.LastUpdate = New-Object System.DateTime($Year,$Month,$Day)
 
+    # reading language driver byte also known as encoding
+    $Position = $DBFFileHandle.Seek(29, [System.IO.SeekOrigin]::Begin)
+    $BytesRead = $DBFFileHandle.Read($NumTemp, 0, 1)
+    $DBFStructure.Encoding = ConvertLanguageDriver2CodePage -LanguageDriver Bin2Int32 ($NumTemp)
+    
     # calculating number of fields, 32 bytes header, 2 bytes end of data and 32 bytes per field definition
     $DBFStructure.NumFields = ($DBFStructure.DataOffset - 32 -2) / 32
     
@@ -155,6 +147,19 @@ function Get-DBFStructure () {
     
     $DBFStructure
     
+}
+
+function ConvertLanguageDriver2CodePage
+{
+    Param ([int]$LanguageDriver)
+
+    # Details https://www.clicketyclick.dk/databases/xbase/format/dbf.html#DBF_NOTE_5_TARGET
+    switch ($LanguageDriver) {
+        1 {437}
+        2 {850}
+        3 {1252}
+        # UTF-8?
+    }
 }
 
 # returns integer from byte array
@@ -221,25 +226,7 @@ function Use-DBF () {
          )
 
     $DBFInfo = New-Object PSObject
-    $DBFInfo | Add-Member -Type NoteProperty -Name Header -Value $null
-    $DBFInfo | Add-Member -Type NoteProperty -Name Type -Value $null
-    $DBFInfo | Add-Member -Type NoteProperty -Name ReadOnly -Value ($ReadWrite -eq $false)
-    $DBFInfo | Add-Member -Type NoteProperty -Name RecNo -Value 0
-    $DBFInfo | Add-Member -Type NoteProperty -Name BOF -Value $true
-    $DBFInfo | Add-Member -Type NoteProperty -Name EOF -Value $true
-    $DBFInfo | Add-Member -Type NoteProperty -Name Deleted -Value $false
-    $DBFInfo | Add-Member -Type NoteProperty -Name Fields -Value @{}
-    $DBFInfo | Add-Member -Type NoteProperty -Name FilehandleOfDBF -Value $null
-    $DBFInfo | Add-Member -Type NoteProperty -Name FilehandleOfMemo -Value $null
-    $DBFInfo | Add-Member -Type ScriptMethod -Name GoTo -Value { param($recNo) _GoTo $this $recNo }
-    $DBFInfo | Add-Member -Type ScriptMethod -Name GoTop -Value { _GoTop $this }
-    $DBFInfo | Add-Member -Type ScriptMethod -Name GoBottom -Value { _GoBottom $this }
-    $DBFInfo | Add-Member -Type ScriptMethod -Name Close -Value { _CloseDBF $this }
-    $DBFInfo | Add-Member -Type ScriptMethod -Name Skip -Value { param($records) _Skip $this $records }
-    $DBFInfo | Add-Member -Type ScriptMethod -Name ListAll -Value { _ListAll $this }
-    $DBFInfo | Add-Member -Type ScriptMethod -Name ReadRecord -Value { param([Parameter(ValueFromPipeline=$true)]$recNo) _ReadRecord $this $recNo }
-    $DBFInfo | Add-Member -Type ScriptMethod -Name GetMemofieldInternals -Value { param($fieldname) _MemofieldInternals $this $fieldname }
-    $DBFInfo | Add-Member -Type ScriptMethod -Name AppendBlank -Value { _AppendBlank $this }
+    _AddPropertiesAndMethods $DBFInfo
 
     $DBFInfo.Type = Test-DBF $DBFFilename
     $DBFInfo.Header = Get-DBFStructure $DBFFilename
@@ -275,6 +262,173 @@ function Use-DBF () {
                                                             [System.IO.FileShare]::ReadWrite)
     }
     
+    $DBFInfo
+}
+
+# adds Properties and Methods to DBFInfo-Object
+Function _AddPropertiesAndMethods {
+    Param(
+        $DBFInfo
+    )
+
+    $DBFInfo | Add-Member -Type NoteProperty -Name Header -Value $null
+    $DBFInfo | Add-Member -Type NoteProperty -Name Type -Value $null
+    $DBFInfo | Add-Member -Type NoteProperty -Name ReadOnly -Value ($ReadWrite -eq $false)
+    $DBFInfo | Add-Member -Type NoteProperty -Name RecNo -Value 0
+    $DBFInfo | Add-Member -Type NoteProperty -Name BOF -Value $true
+    $DBFInfo | Add-Member -Type NoteProperty -Name EOF -Value $true
+    $DBFInfo | Add-Member -Type NoteProperty -Name Deleted -Value $false
+    $DBFInfo | Add-Member -Type NoteProperty -Name Fields -Value @{}
+    $DBFInfo | Add-Member -Type NoteProperty -Name FilehandleOfDBF -Value $null
+    $DBFInfo | Add-Member -Type NoteProperty -Name FilehandleOfMemo -Value $null
+    $DBFInfo | Add-Member -Type ScriptMethod -Name GoTo -Value { param($recNo) _GoTo $this $recNo }
+    $DBFInfo | Add-Member -Type ScriptMethod -Name GoTop -Value { _GoTop $this }
+    $DBFInfo | Add-Member -Type ScriptMethod -Name GoBottom -Value { _GoBottom $this }
+    $DBFInfo | Add-Member -Type ScriptMethod -Name Close -Value { _CloseDBF $this }
+    $DBFInfo | Add-Member -Type ScriptMethod -Name Skip -Value { param($records) _Skip $this $records }
+    $DBFInfo | Add-Member -Type ScriptMethod -Name ListAll -Value { _ListAll $this }
+    $DBFInfo | Add-Member -Type ScriptMethod -Name ReadRecord -Value { param([Parameter(ValueFromPipeline=$true)]$recNo) _ReadRecord $this $recNo }
+    $DBFInfo | Add-Member -Type ScriptMethod -Name GetMemofieldInternals -Value { param($fieldname) _MemofieldInternals $this $fieldname }
+    $DBFInfo | Add-Member -Type ScriptMethod -Name AppendBlank -Value { _AppendBlank $this }
+
+}
+
+# creates an object about the type of DBF-file and if it has a memofile
+Function _NewDBFObject {
+    Param(
+        [int]$DBFType  
+    )
+
+    $DBFObject = New-Object PSObject
+    $DBFObject | Add-Member -Type NoteProperty -Name ID -Value 0
+    $DBFObject | Add-Member -Type NoteProperty -Name Type -Value ""
+    $DBFObject | Add-Member -Type NoteProperty -Name hasMemoFile -Value $false
+    $DBFObject | Add-Member -Type NoteProperty -Name memoExt -Value "DBT"
+    $DBFObject | Add-Member -Type NoteProperty -Name memoBlockSize -Value 512     # DBT Blocksize is always 512Bytes
+    $DBFObject.ID = $DBFType
+    switch ($DBFType)
+    {
+        3 {$DBFObject.Type = "DBF-file"}
+        131 {$DBFObject.Type = "DBF+DBT-files"; $DBFObject.hasMemoFile = $true}
+        139 {$DBFObject.Type = "DBF(dBase IV)+DBT-files"; $DBFObject.hasMemoFile = $true}
+        245 {$DBFObject.Type = "DBF+FPT-files"; $DBFObject.hasMemoFile = $true; $DBFObject.memoExt = "FPT"}
+        default {$DBFObject.Type = "unknown"}
+    }
+
+    $DBFObject
+}
+
+# create new field definition
+Function New-Field {
+	[CmdletBinding()]
+	Param (
+        [String]$Name,
+        [Validateset('Character', 'Logical', 'Numeric', 'Memo', 'Date')]
+        [String]$Type,
+        [int]$Length,
+        [int]$Decimal
+	)
+
+	[PSCustomObject]@{
+                        PSTypeName = "PSDBF.Field";
+                        Name = $Name;
+                        Type = $Type;
+                        Length = $Length;
+                        Decimal = $Decimal;
+					 }
+}
+
+# opens a DBF-file with active record pattern
+function New-DBF () {
+    [CmdletBinding()]
+    Param( 
+        [Parameter(Mandatory=$true,
+                   ValueFromPipeline=$true,
+                   HelpMessage="Provide DBF-filename")]
+        [string]$DBFFilename,
+        [Parameter(Mandatory=$true,
+        HelpMessage="DBF-fields structure")]
+        [PSTypeName('PSDBF.Field')]
+        $Fields
+    )
+
+    $ReadWrite = $true
+
+    $DBFInfo = New-Object PSObject
+    _AddPropertiesAndMethods $DBFInfo
+
+    $hasMemofield = $false
+    foreach ($field in $Fields)
+    {
+        # set default values depending on type of field
+        switch ($field.type) {
+            'C' {$DBFInfo.Fields[$field.Name] = ""}
+            'D' {$DBFInfo.Fields[$field.Name] = (Get-Date).Date}
+            'L' {$DBFInfo.Fields[$field.Name] = $false}
+            'M' {$DBFInfo.Fields[$field.Name] = ""; $hasMemofield = $true}
+            'D' {$DBFInfo.Fields[$field.Name] = 0}
+        }
+    }
+
+    $DBFInfo.FilehandleOfDBF = [System.IO.File]::Open($DBFFilename,
+                                            [System.IO.FileMode]::CreateNew,
+                                            [System.IO.FileAccess]::ReadWrite,
+                                            [System.IO.FileShare]::ReadWrite)
+
+    # writing DBF-Header
+    If ($hasMemofield) {
+        # TODO: support DBT!
+        $DbfHeaderByte = 245
+    } else {
+        $DbfHeaderByte = 3
+    }
+    $DBFInfo.FileHandleOfDBF.WriteByte($DbfHeaderByte)
+
+    $DBFObject = _NewDBFObject -DBFType $DbfHeaderByte
+
+    # writing number of fields
+    
+    # calculating number of fields, 32 bytes header, 2 bytes end of data and 32 bytes per field definition
+    $DBFStructure.NumFields = ($DBFStructure.DataOffset - 32 -2) / 32
+    
+    # reading field defintions
+    $Position = $DBFFileHandle.Seek(32, [System.IO.SeekOrigin]::Begin)    
+    $FNr = 1
+    $Encode = [System.Text.Encoding]::GetEncoding(850)
+    $FieldPos = 0
+    while($FNr -le $DBFStructure.NumFields)
+    {
+        $NumTemp = @(0x00) * 32
+        # reading field structure, per field 32bytes
+        $BytesRead = $DBFFileHandle.Read($NumTemp, 0, 32)   
+        $DBFFieldDef = New-Object PSObject
+        $DBFFieldDef | Add-Member -Type NoteProperty -Name Nr -Value 1
+        $DBFFieldDef | Add-Member -Type NoteProperty -Name Name -Value "Name"
+        $DBFFieldDef | Add-Member -Type NoteProperty -Name Type -Value "C"
+        $DBFFieldDef | Add-Member -Type NoteProperty -Name Length -Value 0
+        $DBFFieldDef | Add-Member -Type NoteProperty -Name Decimal -Value 0
+        $DBFFieldDef | Add-Member -Type NoteProperty -Name FieldPos -Value 0
+        $DBFFieldDef.Nr = $FNr
+        $DBFFieldDef.Name = $Encode.GetString($NumTemp[0..9]).TrimEnd(0)
+        $DBFFieldDef.Type = $Encode.GetString($NumTemp[11])
+        $DBFFieldDef.FieldPos = $FieldPos
+        if ($DBFFieldDef.Type -eq "C")
+        {
+            # Clipper + FoxPro special case
+            $DBFFieldDef.Length = $NumTemp[16] + $NumTemp[17] * 256
+            $DBFFieldDef.Decimal = 0
+        }
+        else
+        {
+            $DBFFieldDef.Length = $NumTemp[16]
+            $DBFFieldDef.Decimal = $NumTemp[17]
+        }
+        $FieldPos += $DBFFieldDef.Length
+        $FNr++
+        $DBFStructure.Fields += $DBFFieldDef
+    }
+
+
     $DBFInfo
 }
 
