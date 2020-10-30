@@ -98,10 +98,12 @@ function Get-DBFStructure () {
     $Day=$NumTemp[2]
     $DBFStructure.LastUpdate = New-Object System.DateTime($Year,$Month,$Day)
 
+    $NumTemp = @(0x00) * 4
+
     # reading language driver byte also known as encoding
     $Position = $DBFFileHandle.Seek(29, [System.IO.SeekOrigin]::Begin)
     $BytesRead = $DBFFileHandle.Read($NumTemp, 0, 1)
-    $DBFStructure.Encoding = ConvertLanguageDriver2CodePage -LanguageDriver Bin2Int32 ($NumTemp)
+    $DBFStructure.Encoding = ConvertLanguageDriver2CodePage -LanguageDriver (Bin2Int32 ($NumTemp))
     
     # calculating number of fields, 32 bytes header, 2 bytes end of data and 32 bytes per field definition
     $DBFStructure.NumFields = ($DBFStructure.DataOffset - 32 -2) / 32
