@@ -126,7 +126,9 @@ function Get-DBFStructure () {
         $DBFFieldDef | Add-Member -Type NoteProperty -Name Decimal -Value 0
         $DBFFieldDef | Add-Member -Type NoteProperty -Name FieldPos -Value 0
         $DBFFieldDef.Nr = $FNr
-        $DBFFieldDef.Name = $Encode.GetString($NumTemp[0..9]).TrimEnd(0)
+	$ZeroIndex=[array]::IndexOf($NumTemp, [byte]0)
+	If (($ZeroIndex -eq -1) -or ($ZeroIndex -gt 9)) {$ZeroIndex=9}
+        $DBFFieldDef.Name = $Encode.GetString($NumTemp[0..$ZeroIndex]).TrimEnd(0)
         $DBFFieldDef.Type = $Encode.GetString($NumTemp[11])
         $DBFFieldDef.FieldPos = $FieldPos
         if ($DBFFieldDef.Type -eq "C")
