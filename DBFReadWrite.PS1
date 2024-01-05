@@ -665,7 +665,7 @@ function _ReadRecord ($DBFInfo, $recNo)
                     {
                         $Data = "0.0"
                     }
-                    $DBFInfo.Fields[$field.Name] = [Convert]::ToDouble($Data,$Culture)
+                    $DBFInfo.Fields[$field.Name] = [Convert]::ToDecimal($Data,$Culture)
                 }
 
             "M" { 
