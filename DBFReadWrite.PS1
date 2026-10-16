@@ -61,7 +61,8 @@ function Get-DBFStructure () {
     $DBFStructure | Add-Member -Type NoteProperty -Name NumFields -Value 0
     #$DBFStructure | Add-Member -Type NoteProperty -Name Fields -Value []$DBFFields
     $DBFStructure | Add-Member -Type NoteProperty -Name Fields -Value @()
-    $DBFStructure | Add-Member -Type NoteProperty -Name Encoding -Value @()
+    $DBFStructure | Add-Member -Type NoteProperty -Name Encoding -Value 0
+    $DBFStructure | Add-Member -Type NoteProperty -Name LanguageDriver -Value 0
 
     # PropertySet: http://mow001.blogspot.de/2006/01/some-fun-with-monads-add-member-mp3.html
     # to ask for propertySet use select from the returned object: $x | select HeaderInfo
@@ -96,55 +97,55 @@ function Get-DBFStructure () {
     $Year=$NumTemp[0]+1900
     $Month=$NumTemp[1]
     $Day=$NumTemp[2]
-    $DBFStructure.LastUpdate = New-Object System.DateTime($Year,$Month,$Day)
+    if ($Month -eq 0 -or $Day -eq 0) {
+        $DBFStructure.LastUpdate = [DateTime]::MinValue
+    } else {
+        $DBFStructure.LastUpdate = New-Object System.DateTime($Year,$Month,$Day)
+    }
 
     $NumTemp = @(0x00) * 4
 
     # reading language driver byte also known as encoding
     $Position = $DBFFileHandle.Seek(29, [System.IO.SeekOrigin]::Begin)
     $BytesRead = $DBFFileHandle.Read($NumTemp, 0, 1)
-    $DBFStructure.Encoding = ConvertLanguageDriver2CodePage -LanguageDriver (Bin2Int32 ($NumTemp))
+    $DBFStructure.LanguageDriver = [int]$NumTemp[0]
+    $DBFStructure.Encoding = [int](ConvertLanguageDriver2CodePage -LanguageDriver $DBFStructure.LanguageDriver)
     
-    # calculating number of fields, 32 bytes header, 2 bytes end of data and 32 bytes per field definition
-    $DBFStructure.NumFields = ($DBFStructure.DataOffset - 32 -2) / 32
-    
-    # reading field defintions
-    $Position = $DBFFileHandle.Seek(32, [System.IO.SeekOrigin]::Begin)    
-    $FNr = 1
-    $Encode = [System.Text.Encoding]::GetEncoding(850)
-    $FieldPos = 0
-    while($FNr -le $DBFStructure.NumFields)
-    {
-        $NumTemp = @(0x00) * 32
-        # reading field structure, per field 32bytes
-        $BytesRead = $DBFFileHandle.Read($NumTemp, 0, 32)   
-        $DBFFieldDef = New-Object PSObject
-        $DBFFieldDef | Add-Member -Type NoteProperty -Name Nr -Value 1
-        $DBFFieldDef | Add-Member -Type NoteProperty -Name Name -Value "Name"
-        $DBFFieldDef | Add-Member -Type NoteProperty -Name Type -Value "C"
-        $DBFFieldDef | Add-Member -Type NoteProperty -Name Length -Value 0
-        $DBFFieldDef | Add-Member -Type NoteProperty -Name Decimal -Value 0
-        $DBFFieldDef | Add-Member -Type NoteProperty -Name FieldPos -Value 0
-        $DBFFieldDef.Nr = $FNr
-	$ZeroIndex=[array]::IndexOf($NumTemp, [byte]0)
-	If (($ZeroIndex -eq -1) -or ($ZeroIndex -gt 9)) {$ZeroIndex=9}
-        $DBFFieldDef.Name = $Encode.GetString($NumTemp[0..$ZeroIndex]).TrimEnd(0)
-        $DBFFieldDef.Type = $Encode.GetString($NumTemp[11])
-        $DBFFieldDef.FieldPos = $FieldPos
-        if ($DBFFieldDef.Type -eq "C")
-        {
-            # Clipper + FoxPro special case
-            $DBFFieldDef.Length = $NumTemp[16] + $NumTemp[17] * 256
-            $DBFFieldDef.Decimal = 0
+    # Field descriptors end with 0x0D. Header lengths may include padding.
+    [void]$DBFFileHandle.Seek(32, [System.IO.SeekOrigin]::Begin)
+	$FieldPos = 0
+    while ($DBFFileHandle.Position -lt $DBFStructure.DataOffset) {
+        $FirstByte = $DBFFileHandle.ReadByte()
+        if ($FirstByte -eq 0x0D) { break }
+        if ($FirstByte -lt 0 -or $DBFFileHandle.Position + 31 -gt $DBFStructure.DataOffset) {
+            throw "Invalid DBF field descriptor terminator."
+		}
+        [byte[]]$NumTemp = New-Object byte[] 32
+        $NumTemp[0] = [byte]$FirstByte
+        if ($DBFFileHandle.Read($NumTemp, 1, 31) -ne 31) { throw "Truncated DBF field descriptor." }
+        $ZeroIndex = [Array]::IndexOf($NumTemp, [byte]0, 0, 11)
+        if ($ZeroIndex -lt 0) { $ZeroIndex = 11 }
+        $Name = [Text.Encoding]::ASCII.GetString($NumTemp, 0, $ZeroIndex)
+        if ([string]::IsNullOrEmpty($Name)) { throw "DBF field with empty name." }
+        $Type = [char]$NumTemp[11]
+        $Length = [int]$NumTemp[16]
+        $Decimals = [int]$NumTemp[17]
+        # Clipper long-character fields encode their length across bytes 16/17.
+        if ($Type -eq 'C') {
+            $Length += 256 * $Decimals
+            $Decimals = 0
+		}
+        if ($Length -lt 1) { throw "Invalid field length in '$Name'." }
+        $DBFStructure.Fields += [pscustomobject]@{
+            Nr = $DBFStructure.Fields.Count + 1; Name = $Name; Type = [string]$Type
+            FieldPos = $FieldPos; Length = $Length; Decimal = $Decimals
         }
-        else
-        {
-            $DBFFieldDef.Length = $NumTemp[16]
-            $DBFFieldDef.Decimal = $NumTemp[17]
-        }
-        $FieldPos += $DBFFieldDef.Length
-        $FNr++
-        $DBFStructure.Fields += $DBFFieldDef
+        $FieldPos += $Length
+    }
+    if ($FirstByte -ne 0x0D) { throw "Missing DBF field descriptor terminator." }
+    $DBFStructure.NumFields = $DBFStructure.Fields.Count
+    if ($FieldPos + 1 -ne $DBFStructure.RecordSize) {
+        throw "DBF layout inconsistent: fields use $FieldPos bytes, record size is $($DBFStructure.RecordSize)."
     }
     
     $DBFFileHandle.Close()
@@ -153,17 +154,233 @@ function Get-DBFStructure () {
     
 }
 
-function ConvertLanguageDriver2CodePage
-{
-    Param ([int]$LanguageDriver)
-
-    # Details https://www.clicketyclick.dk/databases/xbase/format/dbf.html#DBF_NOTE_5_TARGET
-    switch ($LanguageDriver) {
-        1 {437}
-        2 {850}
-        3 {1252}
-        # UTF-8?
+function ConvertLanguageDriver2CodePage {
+    param([int]$LanguageDriver)
+    # Common dBASE/FoxPro language driver markers; 0/unknown is ambiguous
+    # (especially for Harbour) and MUST be overridden with -CodePage.
+	switch ($LanguageDriver) {
+        0x01 { return 437 }
+        0x02 { return 850 }
+        0x03 { return 1252 }
+        0x57 { return 1252 }
+        0x64 { return 852 }
+        0x65 { return 866 }
+        0x66 { return 865 }
+        0x67 { return 861 }
+        0x6A { return 737 }
+        0x6B { return 857 }
+        0xC8 { return 1250 }
+        0xC9 { return 1251 }
+        0xCA { return 1254 }
+        0xCB { return 1253 }
+        default { return 0 }
     }
+}
+
+# Explicit -CodePage always wins; we never silently assume CP850.
+function _ResolveDBFEncoding([int]$CodePage, [int]$LanguageDriver) {
+    if ($CodePage -eq 0) { $CodePage = ConvertLanguageDriver2CodePage $LanguageDriver }
+    if ($CodePage -eq 0) {
+        throw ('Unknown DBF codepage (language driver 0x{0:X2}). Supply -CodePage, e.g. 850 or 1252.' -f $LanguageDriver)
+    }
+    if ($PSVersionTable.PSEdition -eq 'Core') {
+        Add-Type -AssemblyName System.Text.Encoding.CodePages
+        [Text.Encoding]::RegisterProvider([Text.CodePagesEncodingProvider]::Instance)
+    }
+    return [Text.Encoding]::GetEncoding($CodePage,
+        [Text.EncoderFallback]::ExceptionFallback,
+        [Text.DecoderFallback]::ExceptionFallback)
+}
+
+function _ReadExactly([IO.Stream]$Stream, [int]$Count) {
+    [byte[]]$Data = New-Object byte[] $Count
+    $Offset = 0
+    while ($Offset -lt $Count) {
+        $N = $Stream.Read($Data, $Offset, $Count - $Offset)
+        if ($N -le 0) { throw 'Unexpected end of DBF/FPT file.' }
+        $Offset += $N
+    }
+    return ,$Data
+}
+
+function _UInt32BE([byte[]]$Bytes, [int]$Offset = 0) {
+    return [uint32](([uint64]$Bytes[$Offset] -shl 24) -bor
+        ([uint64]$Bytes[$Offset+1] -shl 16) -bor
+        ([uint64]$Bytes[$Offset+2] -shl 8) -bor [uint64]$Bytes[$Offset+3])
+}
+function _UInt32LE([byte[]]$Bytes, [int]$Offset = 0) {
+    return [uint32](([uint64]$Bytes[$Offset+3] -shl 24) -bor
+        ([uint64]$Bytes[$Offset+2] -shl 16) -bor
+        ([uint64]$Bytes[$Offset+1] -shl 8) -bor [uint64]$Bytes[$Offset])
+}
+function _UInt32BytesBE([uint32]$Value) {
+    [byte[]]$Bytes = [BitConverter]::GetBytes($Value)
+    if ([BitConverter]::IsLittleEndian) { [Array]::Reverse($Bytes) }
+    return ,$Bytes
+}
+function _UInt32BytesLE([uint32]$Value) {
+    [byte[]]$Bytes = [BitConverter]::GetBytes($Value)
+    if (-not [BitConverter]::IsLittleEndian) { [Array]::Reverse($Bytes) }
+    return ,$Bytes
+}
+
+function _HasPendingDBFChanges($DBFInfo) {
+    if ($DBFInfo.LoadedRecNo -le 0) { return $false }
+    foreach ($F in $DBFInfo.Header.Fields) {
+        $Name = $F.Name
+        if (-not [object]::Equals($DBFInfo.Fields[$Name], $DBFInfo.OriginalValues[$Name])) {
+            return $true
+        }
+    }
+    return $false
+}
+
+# Preflight: serialize an edited field before writing ANY record bytes.
+function _SerializeDBFField($DBFInfo, $Field, $Value) {
+    $Len = [int]$Field.Length
+    [byte[]]$Bytes = New-Object byte[] $Len
+    for ($I = 0; $I -lt $Len; $I++) { $Bytes[$I] = 0x20 }
+    $Culture = [Globalization.CultureInfo]::InvariantCulture
+    switch ($Field.Type) {
+        'C' {
+            $Encoded = $DBFInfo.TextEncoding.GetBytes([string]$Value)
+            if ($Encoded.Length -gt $Len) { throw "Text too long for '$($Field.Name)' ($($Encoded.Length) > $Len bytes)." }
+            [Array]::Copy($Encoded, 0, $Bytes, 0, $Encoded.Length)
+        }
+        'N' {
+            if ($null -ne $Value -and [string]$Value -ne '') {
+                if ($Value -is [string]) { $Num = [decimal]::Parse($Value, [Globalization.NumberStyles]::Float, $Culture) }
+                else { $Num = [Convert]::ToDecimal($Value, $Culture) }
+                if ([decimal]::Round($Num, [int]$Field.Decimal) -ne $Num) { throw "Too many decimals for '$($Field.Name)'." }
+                $Number = $Num.ToString(('F{0}' -f [int]$Field.Decimal), $Culture)
+                if ($Number.Length -gt $Len) { throw "Number too long for '$($Field.Name)'." }
+                $Src = [Text.Encoding]::ASCII.GetBytes($Number)
+                [Array]::Copy($Src, 0, $Bytes, $Len - $Src.Length, $Src.Length)
+            }
+        }
+        'F' {
+            # FoxPro floating ASCII fields, with the same fixed-width constraints.
+            if ($null -ne $Value -and [string]$Value -ne '') {
+                if ($Value -is [string]) { $Num = [decimal]::Parse($Value, [Globalization.NumberStyles]::Float, $Culture) }
+                else { $Num = [Convert]::ToDecimal($Value, $Culture) }
+                if ([decimal]::Round($Num, [int]$Field.Decimal) -ne $Num) { throw "Too many decimals for '$($Field.Name)'." }
+                $Number = $Num.ToString(('F{0}' -f [int]$Field.Decimal), $Culture)
+                if ($Number.Length -gt $Len) { throw "Float too long for '$($Field.Name)'." }
+                $Src = [Text.Encoding]::ASCII.GetBytes($Number)
+                [Array]::Copy($Src, 0, $Bytes, $Len - $Src.Length, $Src.Length)
+            }
+        }
+        'D' {
+            if ($Len -ne 8) { throw "Unsupported date width in '$($Field.Name)'." }
+            if ($null -ne $Value -and [datetime]$Value -ne [datetime]::MinValue) {
+                $Src = [Text.Encoding]::ASCII.GetBytes(([datetime]$Value).ToString('yyyyMMdd', $Culture))
+                [Array]::Copy($Src, 0, $Bytes, 0, 8)
+            }
+        }
+        'L' {
+            if ($Len -ne 1) { throw "Unsupported logical width in '$($Field.Name)'." }
+            if ($null -ne $Value -and $Value -isnot [bool]) { throw "Logical '$($Field.Name)' requires true, false or null." }
+            if ($null -eq $Value) { $Bytes[0] = [byte][char]'?' }
+            elseif ([bool]$Value) { $Bytes[0] = [byte][char]'T' }
+            else { $Bytes[0] = [byte][char]'F' }
+        }
+        default { throw "Write not supported for DBF field '$($Field.Name)' (type $($Field.Type))." }
+    }
+    return ,$Bytes
+}
+
+# FPT append-only: never overwrite or reuse existing memo blocks (safe for shared old references).
+function _AppendFPTMemo($DBFInfo, [byte[]]$Payload) {
+    $FPT = $DBFInfo.FilehandleOfMemo
+    if ($null -eq $FPT -or -not $FPT.CanWrite) { throw 'FPT is not writable.' }
+    $BlockSize = [int]$DBFInfo.Type.memoBlockSize
+    if ($BlockSize -lt 8) { throw 'Invalid FPT block size.' }
+    [void]$FPT.Seek(0, [IO.SeekOrigin]::Begin)
+    $Header = _ReadExactly $FPT 8
+    $HeaderNext = [uint64](_UInt32BE $Header 0)
+    $FileNext = [uint64][Math]::Ceiling([double]$FPT.Length / $BlockSize)
+    $Next = [Math]::Max([Math]::Max($HeaderNext, $FileNext), [uint64][Math]::Ceiling(512.0/$BlockSize))
+    $Blocks = [uint64][Math]::Ceiling(([double]$Payload.Length + 8) / $BlockSize)
+    if ($Next + $Blocks -gt [uint32]::MaxValue) { throw 'FPT block address overflow.' }
+    $Address = [long]$Next * $BlockSize
+    [void]$FPT.Seek($Address, [IO.SeekOrigin]::Begin)
+    [byte[]]$TypeBytes = _UInt32BytesBE 1
+    [byte[]]$LengthBytes = _UInt32BytesBE ([uint32]$Payload.Length)
+    $FPT.Write($TypeBytes, 0, 4)
+    $FPT.Write($LengthBytes, 0, 4)
+    $FPT.Write($Payload, 0, $Payload.Length)
+    $PaddedEnd = [long]($Next + $Blocks) * $BlockSize
+    if ($FPT.Length -lt $PaddedEnd) { $FPT.SetLength($PaddedEnd) }
+    $FPT.Flush()
+    [void]$FPT.Seek(0, [IO.SeekOrigin]::Begin)
+    [byte[]]$NewNext = _UInt32BytesBE ([uint32]($Next + $Blocks))
+    $FPT.Write($NewNext, 0, 4)
+    $FPT.Flush()
+    return [uint32]$Next
+}
+
+function _MemoPointerBytes($Field, [uint32]$Pointer) {
+    if ($Field.Length -eq 4) { return ,(_UInt32BytesLE $Pointer) }
+    if ($Field.Length -eq 10) {
+        if ($Pointer -eq 0) { return ,([Text.Encoding]::ASCII.GetBytes('          ')) }
+        return ,([Text.Encoding]::ASCII.GetBytes($Pointer.ToString().PadLeft(10, ' ')))
+    }
+    throw "Unsupported FPT memo pointer width $($Field.Length) in '$($Field.Name)'."
+}
+
+function _WriteDBFHeaderDate($DBFInfo) {
+    $Today = Get-Date
+    [byte[]]$DateBytes = @([byte]($Today.Year - 1900), [byte]$Today.Month, [byte]$Today.Day)
+    [void]$DBFInfo.FilehandleOfDBF.Seek(1, [IO.SeekOrigin]::Begin)
+    $DBFInfo.FilehandleOfDBF.Write($DateBytes, 0, 3)
+    $DBFInfo.Header.LastUpdate = $Today.Date
+}
+
+function _SaveRecord($DBFInfo) {
+    if ($DBFInfo.ReadOnly -or -not $DBFInfo.FilehandleOfDBF.CanWrite) { throw 'DBF opened read-only.' }
+    if ($DBFInfo.LoadedRecNo -le 0 -or $DBFInfo.LoadedRecNo -ne $DBFInfo.RecNo) { throw 'No current loaded record.' }
+    $Changed = @()
+    $Serialized = @{}
+    foreach ($Field in $DBFInfo.Header.Fields) {
+        $Name = $Field.Name
+        if (-not [object]::Equals($DBFInfo.Fields[$Name], $DBFInfo.OriginalValues[$Name])) {
+            $Changed += $Field
+            if ($Field.Type -eq 'M') {
+                if ($DBFInfo.Type.memoExt -ne 'FPT') { throw 'Only FPT memo writes are supported.' }
+                if ($Field.Length -notin @(4,10)) { throw "Unsupported memo pointer width in '$Name'." }
+                if ($null -ne $DBFInfo.Fields[$Name] -and $DBFInfo.Fields[$Name] -isnot [string]) { throw "Memo '$Name' must be text." }
+                $Serialized[$Name] = $DBFInfo.TextEncoding.GetBytes([string]$DBFInfo.Fields[$Name])
+            } else {
+                $Serialized[$Name] = _SerializeDBFField $DBFInfo $Field $DBFInfo.Fields[$Name]
+            }
+        }
+    }
+    if ($Changed.Count -eq 0) { return }
+    $Position = [long]$DBFInfo.Header.DataOffset + ([long]$DBFInfo.RecNo - 1) * $DBFInfo.Header.RecordSize
+    $DBF = $DBFInfo.FilehandleOfDBF
+    [void]$DBF.Seek($Position, [IO.SeekOrigin]::Begin)
+    $Current = _ReadExactly $DBF $DBFInfo.Header.RecordSize
+    for ($I = 0; $I -lt $Current.Length; $I++) {
+        if ($Current[$I] -ne $DBFInfo.OriginalRecord[$I]) {
+            throw 'Current record was changed on disk; reload before writing.'
+        }
+    }
+    [byte[]]$NewRecord = [byte[]]$Current.Clone()
+    foreach ($Field in $Changed) {
+        $Name = $Field.Name
+        if ($Field.Type -eq 'M') {
+            $Pointer = [uint32]0
+            if ($Serialized[$Name].Length -gt 0) { $Pointer = _AppendFPTMemo $DBFInfo $Serialized[$Name] }
+            $NewBytes = _MemoPointerBytes $Field $Pointer
+        } else { $NewBytes = [byte[]]$Serialized[$Name] }
+        [Array]::Copy($NewBytes, 0, $NewRecord, 1 + [int]$Field.FieldPos, [int]$Field.Length)
+    }
+    [void]$DBF.Seek($Position, [IO.SeekOrigin]::Begin)
+    $DBF.Write($NewRecord, 0, $NewRecord.Length)
+    _WriteDBFHeaderDate $DBFInfo
+    $DBF.Flush()
+    $DBFInfo.OriginalRecord = $NewRecord
+    foreach ($Field in $DBFInfo.Header.Fields) { $DBFInfo.OriginalValues[$Field.Name] = $DBFInfo.Fields[$Field.Name] }
 }
 
 # returns integer from byte array
@@ -216,7 +433,7 @@ function Int322BinBE ()
     return $NumTemp
 }
 
-# opens a DBF-file with active record pattern
+# Open DBF for reading or (exclusive) update. No implicit CP850 fallback.
 function Use-DBF () {
     [CmdletBinding()]
     param( 
@@ -226,47 +443,41 @@ function Use-DBF () {
         [string]$DBFFilename,
         [Parameter(Mandatory=$false,
                    HelpMessage="Open DBF in ReadWrite-mode")]
-        [Switch]$ReadWrite=$false
-         )
+        [Switch]$ReadWrite=$false,
+		[int]$CodePage = 0
+	)
 
     $DBFInfo = New-Object PSObject
     _AddPropertiesAndMethods $DBFInfo
 
+	$DBFInfo.ReadOnly = -not [bool]$ReadWrite
     $DBFInfo.Type = Test-DBF $DBFFilename
+	if ($DBFInfo.Type.Type -eq 'unknown') { throw ('Unsupported DBF signature 0x{0:X2}' -f $DBFInfo.Type.ID) }
     $DBFInfo.Header = Get-DBFStructure $DBFFilename
     
-    foreach ($field in $DBFInfo.Header.Fields)
-    {
-        # TODO: every field should get its own getter and setter function:
-        # $DBFInfo.Fields | Add-Member -MemberType ScriptProperty -Name "Fieldname" -Value {$this.Fieldbuffer[Fieldname]} -SecondValue {Param($Value);$Value;$this.Fieldbuffer[Fieldname]=$Value}
-        # there should also be a dirty flag if a field has changed 
-        $DBFInfo.Fields[$field.Name] = "val"  # TODO: check val, better empty
-    }
-    
-    if ($ReadWrite)
-    {
-        $DBFInfo.FilehandleOfDBF = [System.IO.File]::Open($DBFFilename,
-                                            [System.IO.FileMode]::Open,
-                                            [System.IO.FileAccess]::ReadWrite,
-                                            [System.IO.FileShare]::ReadWrite)
-    }
-    else
-    {
-        $DBFInfo.FilehandleOfDBF = [System.IO.File]::Open($DBFFilename,
-                                                        [System.IO.FileMode]::Open,
-                                                        [System.IO.FileAccess]::Read,
-                                                        [System.IO.FileShare]::ReadWrite)
-    }
+    $DBFInfo.TextEncoding = _ResolveDBFEncoding $CodePage $DBFInfo.Header.LanguageDriver
+    $DBFInfo.Header.Encoding = $DBFInfo.TextEncoding.CodePage
+    foreach ($Field in $DBFInfo.Header.Fields) { $DBFInfo.Fields[$Field.Name] = $null }
+    $Access = [IO.FileAccess]::Read
+    $Share = [IO.FileShare]::ReadWrite
+    if ($ReadWrite) {
+        $Access = [IO.FileAccess]::ReadWrite
+        $Share = [IO.FileShare]::None  # no silent lost updates / concurrent memo allocation
+	}
 
-    if ($DBFInfo.Type.hasMemoFile)
-    {
-        $DBFInfo.FilehandleOfMemo = [System.IO.File]::Open([System.IO.Path]::ChangeExtension($DBFFilename, $DBFInfo.Type.MemoExt),
-                                                            [System.IO.FileMode]::Open,
-                                                            [System.IO.FileAccess]::Read,
-                                                            [System.IO.FileShare]::ReadWrite)
-    }
-    
-    $DBFInfo
+    try {
+        $DBFInfo.FilehandleOfDBF = [IO.File]::Open($DBFFilename, [IO.FileMode]::Open, $Access, $Share)
+        if ($DBFInfo.Type.hasMemoFile) {
+            $MemoFile = [IO.Path]::ChangeExtension($DBFFilename, $DBFInfo.Type.memoExt)
+            $DBFInfo.FilehandleOfMemo = [IO.File]::Open($MemoFile, [IO.FileMode]::Open, $Access, $Share)
+        }
+    } catch {
+        if ($null -ne $DBFInfo.FilehandleOfDBF) { $DBFInfo.FilehandleOfDBF.Dispose() }
+        if ($null -ne $DBFInfo.FilehandleOfMemo) { $DBFInfo.FilehandleOfMemo.Dispose() }
+        throw
+	}
+
+    return $DBFInfo
 }
 
 # adds Properties and Methods to DBFInfo-Object
@@ -277,7 +488,11 @@ Function _AddPropertiesAndMethods {
 
     $DBFInfo | Add-Member -Type NoteProperty -Name Header -Value $null
     $DBFInfo | Add-Member -Type NoteProperty -Name Type -Value $null
-    $DBFInfo | Add-Member -Type NoteProperty -Name ReadOnly -Value ($ReadWrite -eq $false)
+    $DBFInfo | Add-Member -Type NoteProperty -Name ReadOnly -Value $true
+    $DBFInfo | Add-Member -Type NoteProperty -Name TextEncoding -Value $null
+    $DBFInfo | Add-Member -Type NoteProperty -Name OriginalRecord -Value $null
+    $DBFInfo | Add-Member -Type NoteProperty -Name OriginalValues -Value @{}
+    $DBFInfo | Add-Member -Type NoteProperty -Name LoadedRecNo -Value 0
     $DBFInfo | Add-Member -Type NoteProperty -Name RecNo -Value 0
     $DBFInfo | Add-Member -Type NoteProperty -Name BOF -Value $true
     $DBFInfo | Add-Member -Type NoteProperty -Name EOF -Value $true
@@ -294,6 +509,27 @@ Function _AddPropertiesAndMethods {
     $DBFInfo | Add-Member -Type ScriptMethod -Name ReadRecord -Value { param([Parameter(ValueFromPipeline=$true)]$recNo) _ReadRecord $this $recNo }
     $DBFInfo | Add-Member -Type ScriptMethod -Name GetMemofieldInternals -Value { param($fieldname) _MemofieldInternals $this $fieldname }
     $DBFInfo | Add-Member -Type ScriptMethod -Name AppendBlank -Value { _AppendBlank $this }
+    $DBFInfo | Add-Member -Type ScriptMethod -Name SaveRecord -Value { _SaveRecord $this }
+    # Raw pointer repair; does not need to read or decode the affected memo.
+    # $db.ResetMemoPointer('NOTIZ', 42) works even if GoTo(42) fails.
+    $DBFInfo | Add-Member -Type ScriptMethod -Name ResetMemoPointer -Value {
+        param([string]$FieldName, $RecNo = $null)
+        _Reset-MemofieldPointer $this $FieldName $RecNo
+    }
+    # Check a record's FPT references without trying to decode all DBF fields.
+    $DBFInfo | Add-Member -Type ScriptMethod -Name CheckMemoPointers -Value {
+        param([long]$RecNo)
+        if (_HasPendingDBFChanges $this) { throw 'Save or discard pending changes before scanning memo pointers.' }
+        if ($RecNo -lt 1 -or $RecNo -gt [long]$this.Header.NumRecords) { throw "Invalid DBF record number: $RecNo" }
+        $Previous = $this.RecNo
+        try {
+            $this.RecNo = $RecNo
+            _Check-MemofieldIntegrity $this
+        } finally { $this.RecNo = $Previous }
+    }
+    $DBFInfo | Add-Member -Type ScriptMethod -Name DiscardChanges -Value {
+        foreach ($Field in $this.Header.Fields) { $this.Fields[$Field.Name] = $this.OriginalValues[$Field.Name] }
+    }
 
 }
 
@@ -313,6 +549,9 @@ Function _NewDBFObject {
     switch ($DBFType)
     {
         3 {$DBFObject.Type = "DBF-file"}
+        48 {$DBFObject.Type = "Visual FoxPro+FPT"; $DBFObject.hasMemoFile = $true; $DBFObject.memoExt = "FPT"}
+        49 {$DBFObject.Type = "Visual FoxPro+FPT"; $DBFObject.hasMemoFile = $true; $DBFObject.memoExt = "FPT"}
+        50 {$DBFObject.Type = "Visual FoxPro+FPT"; $DBFObject.hasMemoFile = $true; $DBFObject.memoExt = "FPT"}
         131 {$DBFObject.Type = "DBF+DBT-files"; $DBFObject.hasMemoFile = $true}
         139 {$DBFObject.Type = "DBF(dBase IV)+DBT-files"; $DBFObject.hasMemoFile = $true}
         245 {$DBFObject.Type = "DBF+FPT-files"; $DBFObject.hasMemoFile = $true; $DBFObject.memoExt = "FPT"}
@@ -519,167 +758,117 @@ function Zap_DBF () {
 
 # should be internal functions
 
-function _AppendBlank ($DBFInfo)
-{
-    [System.Byte[]]$Numtemp=@()
-
-    if ($DBFInfo.ReadOnly) { throw "file is readonly"} # $DbfInfo.Name}
-
-    $DBFFileHandle = $DBFInfo.FileHandleOfDBF
-    # append new Record 
-    $RecordPos = $DBFInfo.Header.DataOffset + $DBFInfo.Header.NumRecords * $DBFInfo.Header.RecordSize
-    $Position = $DBFFileHandle.Seek($RecordPos, [System.IO.SeekOrigin]::Begin)
-    $EmptyRecord = [Byte[]]0x20*$DBFInfo.Header.RecordSize
-    $DBFFileHandle.Write($EmptyRecord, 0, $DBFInfo.Header.RecordSize)
-
-    # increase RecordCount
-    $NumTemp=@(0x00)*4
-    $Position = $DBFFileHandle.Seek(4, [System.IO.SeekOrigin]::Begin)
-    $BytesRead = $DBFFileHandle.Read($NumTemp, 0, 4)
-    $DBFInfo.Header.NumRecords = (Bin2Int32 $NumTemp) +1
-    $NumTemp = Int322Bin $DBFInfo.Header.NumRecords
-    $Position = $DBFFileHandle.Seek(4, [System.IO.SeekOrigin]::Begin)
-    $BytesWritten = $DBFFileHandle.Write($NumTemp, 0, 4)
-
-    # write modification date in header
-    $NumTemp=@(0x00)*3
-    $Date = Get-Date
-    $NumTemp[0] = $Date.Year -1900
-    $NumTemp[1] = $Date.Month
-    $NumTemp[2] = $Date.Day
-    $Position = $DBFFileHandle.Seek(1, [System.IO.SeekOrigin]::Begin)
-    $BytesWritten = $DBFFileHandle.Write($NumTemp, 0, 3)
-    $DBFInfo.Header.LastUpdate = $Date
-
-    $FlushToDisk = $True
-    $DBFFileHandle.Flush()
-    $DBFFileHandle.Flush($FlushToDisk)
-
-    # make the new record the current record
-    _GoBottom($DBFInfo)
+function _AppendBlank ($DBFInfo) {
+    if ($DBFInfo.ReadOnly) { throw 'DBF opened read-only.' }
+    if (_HasPendingDBFChanges $DBFInfo) { throw 'Unsaved field changes; call SaveRecord first.' }
+    $DBF = $DBFInfo.FilehandleOfDBF
+    $Size = [int]$DBFInfo.Header.RecordSize
+    [byte[]]$Empty = New-Object byte[] $Size
+    for ($I = 0; $I -lt $Size; $I++) { $Empty[$I] = 0x20 }
+    foreach ($Field in $DBFInfo.Header.Fields) {
+        if ($Field.Type -eq 'M' -and $DBFInfo.Type.memoExt -eq 'FPT') {
+            $Ptr = _MemoPointerBytes $Field 0
+            [Array]::Copy($Ptr, 0, $Empty, 1 + $Field.FieldPos, $Field.Length)
+        }
+	}
+    $Offset = [long]$DBFInfo.Header.DataOffset + [long]$DBFInfo.Header.NumRecords * $Size
+    if ($DBF.Length -lt $Offset) { throw 'DBF is truncated; cannot append.' }
+    [void]$DBF.Seek($Offset, [IO.SeekOrigin]::Begin)
+    $DBF.Write($Empty, 0, $Size)
+    $DBF.WriteByte(0x1A)
+    $DBF.SetLength($Offset + $Size + 1)
+    $Count = [uint32]($DBFInfo.Header.NumRecords + 1)
+    [void]$DBF.Seek(4, [IO.SeekOrigin]::Begin)
+    [byte[]]$CountBytes = _UInt32BytesLE $Count
+    $DBF.Write($CountBytes, 0, 4)
+    $DBFInfo.Header.NumRecords = $Count
+    _WriteDBFHeaderDate $DBFInfo
+    $DBF.Flush()
+    $null = _ReadRecord $DBFInfo $Count
 }
 
-function _CloseDBF ($DBFInfo)
-{
-    if ($DBFInfo.FilehandleOfMemo -ne $null)
-    {
-        $this.FilehandleOfMemo.Close()
-        $this.FilehandleOfMemo = $null
+function _CloseDBF ($DBFInfo) {
+    if (_HasPendingDBFChanges $DBFInfo) { throw 'Unsaved changes; call SaveRecord before Close.' }
+    if ($null -ne $DBFInfo.FilehandleOfMemo) {
+        $DBFInfo.FilehandleOfMemo.Dispose()
+        $DBFInfo.FilehandleOfMemo = $null
     }
-    
-    if ($DBFInfo.FilehandleOfDBF -ne $null)
-    {
-        $this.FilehandleOfDBF.Close()
-        $this.FilehandleOfDBF = $null
+    if ($null -ne $DBFInfo.FilehandleOfDBF) {
+        $DBFInfo.FilehandleOfDBF.Dispose()
+        $DBFInfo.FilehandleOfDBF = $null
     }
 }
-
-function _GoBottom ($DBFInfo)
-{
-    $DBFInfo.RecNo = $DBFInfo.Header.NumRecords
-    _ReadRecord $DBFInfo
+function _GoBottom ($DBFInfo) { $null = _ReadRecord $DBFInfo $DBFInfo.Header.NumRecords }
+function _GoTop ($DBFInfo) { $null = _ReadRecord $DBFInfo 1 }
+function _Skip ($DBFInfo, $SkipRecords) {
+    if ($null -eq $SkipRecords) { $SkipRecords = 1 }
+    $null = _ReadRecord $DBFInfo ($DBFInfo.RecNo + $SkipRecords)
 }
-
-function _GoTop ($DBFInfo)
-{
-    $DBFInfo.RecNo = 1
-    _ReadRecord $DBFInfo
-}
-
-function _Skip ($DBFInfo, $SkipRecords)
-{
-    $Rel = 1
-
-    if ($SkipRecords -ne $null)
-    {
-        $Rel = $SkipRecords
-    }
-        
-    $DBFInfo.RecNo += $Rel
-    _ReadRecord $DBFInfo
-
-}
-
-function _Goto ($DBFInfo, $RecNo)
-{
-    $DBFInfo.RecNo = $RecNo
-    _ReadRecord $DBFInfo
-}
+function _Goto ($DBFInfo, $RecNo) { $null = _ReadRecord $DBFInfo $RecNo }
 
 function _ListAll ($DBFInfo)
 {
     1..$DBFInfo.Header.NumRecords
 }
 
-# refreshes the current fieldvalues in the fields hashset
-function _ReadRecord ($DBFInfo, $recNo)
-{
+# Load a record and keep its original bytes. Unsupported field types are
+# preserved byte-for-byte unless the caller explicitly tries to edit them.
+function _ReadRecord ($DBFInfo, $recNo) {
 
-    if ($recNo -ne $null) 
-    { 
-        $DBFInfo.RecNo = $RecNo
-    }
-
-    $Culture = New-Object System.Globalization.CultureInfo "en-us"
-    #$Encode = New-Object System.Text.ASCIIEncoding
-    $Encode = [System.Text.Encoding]::GetEncoding(850)
-    [System.Byte[]]$RecordBuffer = @(0x20) * $DBFInfo.Header.RecordSize
-    $RecordPos = $DBFInfo.Header.DataOffset + ($DBFInfo.RecNo -1) * $DBFInfo.Header.RecordSize
-    #if ($RecordPos -le 
-    $Position = $DBFInfo.FilehandleOfDBF.Seek($RecordPos, [System.IO.SeekOrigin]::Begin)    
-    $BytesRead = $DBFInfo.FilehandleOfDBF.Read($RecordBuffer, 0, $DBFInfo.Header.RecordSize)
-    #if ($Position -gt 0)
-    
-    $DBFInfo.Deleted = $RecordBuffer[0] -ne 32
-    
-    foreach ($field in $DBFInfo.Header.Fields)
-    {
-
-        switch ($field.Type)
-        {
-            "C" { 
-                    $DBFInfo.Fields[$field.Name] = $Encode.GetString($RecordBuffer[($field.FieldPos+1)..($field.FieldPos + $field.Length)]) 
+	if (_HasPendingDBFChanges $DBFInfo) { throw 'Unsaved changes; call SaveRecord before navigating.' }
+    # Do not leave a partially decoded record marked as loaded if a memo is corrupt.
+    $DBFInfo.LoadedRecNo = 0
+    $Target = $DBFInfo.RecNo
+    if ($null -ne $recNo) { $Target = [long]$recNo }
+    if ($Target -lt 1 -or $Target -gt $DBFInfo.Header.NumRecords) { throw "Invalid DBF record number: $Target" }
+    $DBF = $DBFInfo.FilehandleOfDBF
+    $Position = [long]$DBFInfo.Header.DataOffset + ([long]$Target - 1) * $DBFInfo.Header.RecordSize
+    [void]$DBF.Seek($Position, [IO.SeekOrigin]::Begin)
+    [byte[]]$RecordBuffer = _ReadExactly $DBF $DBFInfo.Header.RecordSize
+    $DBFInfo.RecNo = $Target
+    $DBFInfo.Deleted = ($RecordBuffer[0] -ne 0x20)
+    $DBFInfo.OriginalRecord = [byte[]]$RecordBuffer.Clone()
+    $DBFInfo.OriginalValues.Clear()
+    $Culture = [Globalization.CultureInfo]::InvariantCulture
+    foreach ($Field in $DBFInfo.Header.Fields) {
+        $Offset = 1 + [int]$Field.FieldPos
+        $Length = [int]$Field.Length
+        $Value = $null
+        switch ($Field.Type) {
+            'C' { $Value = $DBFInfo.TextEncoding.GetString($RecordBuffer, $Offset, $Length) }
+            'D' {
+                if ($Length -eq 8) {
+                    $Data = [Text.Encoding]::ASCII.GetString($RecordBuffer, $Offset, 8)
+                    if ($Data.Trim().Length -eq 0) { $Value = [DateTime]::MinValue }
+                    else { $Value = [DateTime]::ParseExact($Data, 'yyyyMMdd', $Culture) }
                 }
 
-            "D" { 
-                    $Year=$Encode.GetString($RecordBuffer[($field.FieldPos+1)..($field.FieldPos + 4)])
-                    $Month=$Encode.GetString($RecordBuffer[($field.FieldPos+5)..($field.FieldPos + 6)])
-                    $Day=$Encode.GetString($RecordBuffer[($field.FieldPos+7)..($field.FieldPos + 8)])
-                    if ($Year.Trim().Length -eq 0)
-                    {
-                    $DBFInfo.Fields[$field.Name] = [System.DateTime]::Minvalue
-                    }
-                    else
-                    {
-                    $DBFInfo.Fields[$field.Name] = New-Object System.DateTime($Year,$Month,$Day)
-                    }
+            }
+            'L' {
+                if ($Length -eq 1) {
+                    if ($RecordBuffer[$Offset] -in @(84,116,89,121)) { $Value = $true }
+                    elseif ($RecordBuffer[$Offset] -in @(70,102,78,110)) { $Value = $false }
                 }
-
-            "L" { 
-                    $DBFInfo.Fields[$field.Name] = $RecordBuffer[($field.FieldPos+1)] -eq 84 #"T"
-                }
-
-            "N" { 
-                    $Data=$Encode.GetString($RecordBuffer[($field.FieldPos+1)..($field.FieldPos + $field.Length)])
-                    if($Data.Trim().Length -eq 0)
-                    {
-                        $Data = "0.0"
-                    }
-                    $DBFInfo.Fields[$field.Name] = [Convert]::ToDecimal($Data,$Culture)
-                }
-
-            "M" { 
-                    $Data = _Get-MemofieldData $DBFInfo $field.Name
-                    $DBFInfo.Fields[$field.Name] = $Data 
-                }
+            }
+            'N' {
+                $Data = [Text.Encoding]::ASCII.GetString($RecordBuffer, $Offset, $Length).Trim()
+                if ($Data.Length -gt 0) { $Value = [decimal]::Parse($Data, [Globalization.NumberStyles]::Float, $Culture) }
+            }
+            'F' {
+                $Data = [Text.Encoding]::ASCII.GetString($RecordBuffer, $Offset, $Length).Trim()
+                if ($Data.Length -gt 0) { $Value = [decimal]::Parse($Data, [Globalization.NumberStyles]::Float, $Culture) }
+            }
+            'M' { $Value = _Get-MemofieldData $DBFInfo $Field.Name }
+            default { } # unsupported formats are never re-serialized
         }
+        $DBFInfo.Fields[$Field.Name] = $Value
+        $DBFInfo.OriginalValues[$Field.Name] = $Value
+
     }
     
-    if ($recNo -ne $null) 
-    { 
-        new-object PSObject -Property $DBFInfo.Fields        
-    }
-
+    # Only a fully decoded record is eligible for SaveRecord/dirty tracking.
+    $DBFInfo.LoadedRecNo = $Target
+    if ($null -ne $recNo) { return (New-Object PSObject -Property $DBFInfo.Fields) }
 }
 
 # retrieves the data of a given memo-field
@@ -715,57 +904,37 @@ function _Get-MemofieldDataDBT ($DBFInfo, $FieldPos)
     $retval = "_Get-MemofieldDataDBT() needs to be implemented!"
 }
 
-function _Get-MemofieldDataFPT ($DBFInfo, $FieldPos)
-{
-
-    $retVal = ""
-    $MemoPointer = _GetMemoBlockNumberFromField $DBFInfo $FieldPos
-
-    #$MemofieldSize = 10    
-    #$Encode = [System.Text.Encoding]::GetEncoding(850)
-    #[System.Byte[]]$MemoFieldBuffer = @(0x20) * $MemofieldSize
-    #$RecordFieldPos = $DBFInfo.Header.DataOffset + ($DBFInfo.RecNo -1) * $DBFInfo.Header.RecordSize + $FieldPos.FieldPos +1
-    #$Position = $DBFInfo.FilehandleOfDBF.Seek($RecordFieldPos, [System.IO.SeekOrigin]::Begin)    
-    #$BytesRead = $DBFInfo.FilehandleOfDBF.Read($MemoFieldBuffer, 0, $MemofieldSize)
-    #$MemoPointer = $Encode.GetString($MemoFieldBuffer)
-
-    if ($MemoPointer.Trim().Length -gt 0)
-    {
-        $MemoPointer = [System.Convert]::ToInt32($MemoPointer)
-        $MemoPointer = $MemoPointer * $DBFInfo.Type.memoBlockSize
-        [System.Byte[]]$MemoFieldHeaderBuffer = @(0x0) * 4
-        $Position = $DBFInfo.FilehandleOfMemo.Seek($MemoPointer, [System.IO.SeekOrigin]::Begin)
-        $BytesRead = $DBFInfo.FilehandleOfMemo.Read($MemoFieldHeaderBuffer, 0, 4)
-
-        #check if it's a text memo entry
-        if ((Compare-Object $MemoFieldHeaderBuffer @(0,0,0,1)).length -eq 0)
-        {
-            # get the length of the memofield
-            $BytesRead = $DBFInfo.FilehandleOfMemo.Read($MemoFieldHeaderBuffer, 0, 4)
-            $MemoFieldLength = $MemoFieldHeaderBuffer[0]*256*256*256+$MemoFieldHeaderBuffer[1]*256*256+$MemoFieldHeaderBuffer[2]*256+$MemoFieldHeaderBuffer[3]
-
-            #read the memofield data
-            [System.Byte[]]$MemoFieldBuffer = @(0x20) * $MemoFieldLength
-            $BytesRead = $DBFInfo.FilehandleOfMemo.Read($MemoFieldBuffer, 0, $MemoFieldLength)
-            $retVal = $Encode.GetString($MemoFieldBuffer)
-        }
+function _Get-MemofieldDataFPT ($DBFInfo, $FieldPos) {
+    [uint32]$Pointer = _GetMemoBlockNumberFromField $DBFInfo $FieldPos
+    if ($Pointer -eq 0) { return '' }
+    $FPT = $DBFInfo.FilehandleOfMemo
+    $Address = [long]$Pointer * [long]$DBFInfo.Type.memoBlockSize
+    if ($Address -lt 8 -or $Address + 8 -gt $FPT.Length) { throw "Invalid FPT pointer in '$($FieldPos.Name)'." }
+    [void]$FPT.Seek($Address, [IO.SeekOrigin]::Begin)
+    $Header = _ReadExactly $FPT 8
+    $Type = _UInt32BE $Header 0
+    $Length = _UInt32BE $Header 4
+    if ($Type -ne 1) { throw "FPT memo '$($FieldPos.Name)' is not a plain text memo (type $Type)." }
+    if ($Length -gt [int]::MaxValue -or [uint64]$Length -gt ([uint64]$FPT.Length - [uint64]$FPT.Position)) {
+        throw "Truncated FPT memo '$($FieldPos.Name)'."
     }
 
-    $retVal
+    $Bytes = _ReadExactly $FPT ([int]$Length)
+    return $DBFInfo.TextEncoding.GetString($Bytes)
 }
 
-# retrieves the Pointer to the Block in the memofile
-function _GetMemoBlockNumberFromField ($DBFInfo, $FieldPos)
-{
-    $MemofieldSize = 10
-    $Encode = [System.Text.Encoding]::GetEncoding(850)  # http://en.wikipedia.org/wiki/Code_page_850
-    [System.Byte[]]$MemoFieldBuffer = @(0x20) * $MemofieldSize
-    $RecordFieldPos = $DBFInfo.Header.DataOffset + ($DBFInfo.RecNo -1) * $DBFInfo.Header.RecordSize + $FieldPos.FieldPos +1
-    $Position = $DBFInfo.FilehandleOfDBF.Seek($RecordFieldPos, [System.IO.SeekOrigin]::Begin)    
-    $BytesRead = $DBFInfo.FilehandleOfDBF.Read($MemoFieldBuffer, 0, $MemofieldSize)
-    $MemoPointer = $Encode.GetString($MemoFieldBuffer)
-
-    $MemoPointer
+# FPT pointers can be 4-byte little-endian integers or 10-byte ASCII numbers.
+function _GetMemoBlockNumberFromField ($DBFInfo, $FieldPos) {
+    $Size = [int]$FieldPos.Length
+    if ($Size -notin @(4,10)) { throw "Unsupported FPT memo pointer width $Size in '$($FieldPos.Name)'." }
+    $Location = [long]$DBFInfo.Header.DataOffset + ([long]$DBFInfo.RecNo - 1) * $DBFInfo.Header.RecordSize + $FieldPos.FieldPos + 1
+    [void]$DBFInfo.FilehandleOfDBF.Seek($Location, [IO.SeekOrigin]::Begin)
+    $Bytes = _ReadExactly $DBFInfo.FilehandleOfDBF $Size
+    if ($Size -eq 4) { return (_UInt32LE $Bytes 0) }
+    $Text = [Text.Encoding]::ASCII.GetString($Bytes).Trim()
+    if ($Text.Length -eq 0) { return [uint32]0 }
+    if ($Text -notmatch '^\d{1,10}$') { throw "Invalid FPT pointer '$Text' in '$($FieldPos.Name)'." }
+    return [uint32]::Parse($Text, [Globalization.CultureInfo]::InvariantCulture)
 }
 
 # checks the integrity of the memofields in the current record
@@ -807,82 +976,87 @@ function _Check-MemofieldDataDBT ($DBFInfo, $FieldPos)
     $retval = "_Get-MemofieldDataDBT() needs to be implemented!"
 }
 
-function _Check-MemofieldDataFPT ($DBFInfo, $FieldPos)
-{
-
-    $retVal = $null
-    $MemoPointer = _GetMemoBlockNumberFromField $DBFInfo $FieldPos
-
-    if ($MemoPointer.Trim().Length -gt 0)
-    {
-        $MemoPointer = [System.Convert]::ToInt32($MemoPointer)
-        $MemoPointer = $MemoPointer * $DBFInfo.Type.memoBlockSize
-        [System.Byte[]]$MemoFieldHeaderBuffer = @(0x0) * 4
-        $Position = $DBFInfo.FilehandleOfMemo.Seek($MemoPointer, [System.IO.SeekOrigin]::Begin)
-        $BytesRead = $DBFInfo.FilehandleOfMemo.Read($MemoFieldHeaderBuffer, 0, 4)
-
-        #check if it's a text memo entry
-        if ((Compare-Object $MemoFieldHeaderBuffer @(0,0,0,1)).length -eq 0)
-        {
-            # get the length of the memofield
-            $BytesRead = $DBFInfo.FilehandleOfMemo.Read($MemoFieldHeaderBuffer, 0, 4)
-            $MemoFieldLength = $MemoFieldHeaderBuffer[0]*256*256*256+$MemoFieldHeaderBuffer[1]*256*256+$MemoFieldHeaderBuffer[2]*256+$MemoFieldHeaderBuffer[3]
-
-            #read the memofield data
-            [System.Byte[]]$MemoFieldBuffer = @(0x20) * $MemoFieldLength
-            $BytesRead = $DBFInfo.FilehandleOfMemo.Read($MemoFieldBuffer, 0, $MemoFieldLength)
-            #$retVal = $Encode.GetString($MemoFieldBuffer)
+# Check the raw pointer and FPT memo header without reading or decoding the payload.
+function _Check-MemofieldDataFPT ($DBFInfo, $FieldPos) {
+    try {
+        [uint32]$Pointer = _GetMemoBlockNumberFromField $DBFInfo $FieldPos
+        if ($Pointer -eq 0) { return $null }
+        $FPT = $DBFInfo.FilehandleOfMemo
+        $BlockSize = [long]$DBFInfo.Type.memoBlockSize
+        if ($null -eq $FPT -or $BlockSize -lt 8) { throw 'Missing FPT or invalid block size.' }
+        $Address = [long]$Pointer * $BlockSize
+        if ($Address -lt 8 -or $Address + 8 -gt $FPT.Length) {
+            throw "FPT memo pointer out of range: $Pointer."
         }
-        else
-        {
-            $Integrity = New-Object PSObject
-            $Integrity | Add-Member -Type NoteProperty -Name RecNo -Value $DBFInfo.RecNo
-            $Integrity | Add-Member -Type NoteProperty -Name FieldPos -Value $FieldPos
-            $Integrity | Add-Member -Type NoteProperty -Name HeaderBytes -Value $MemoFieldHeaderBuffer
-            $retval = $Integrity
-            #Write-Host  $FieldPos.Name " Unknown Memofield-Header: $MemoFieldHeaderBuffer"
+        [void]$FPT.Seek($Address, [IO.SeekOrigin]::Begin)
+        [byte[]]$Header = _ReadExactly $FPT 8
+        $Type = _UInt32BE $Header 0
+        [uint32]$PayloadLength = _UInt32BE $Header 4
+        if ($Type -ne 1) { throw "Unexpected FPT memo block type $Type at block $Pointer." }
+        if ([uint64]$PayloadLength -gt ([uint64]$FPT.Length - [uint64]$FPT.Position)) {
+            throw "FPT memo at block $Pointer extends beyond the file."
         }
+        return $null
+    } catch {
+        return [pscustomobject]@{ RecNo = $DBFInfo.RecNo; FieldPos = $FieldPos; Error = $_.Exception.Message }
+
     }
-
-    $retVal
 }
 
-function _Reset-MemofieldPointer ($DBFInfo, $FieldName)
+function _Reset-MemofieldPointer ($DBFInfo, $FieldName, $RecNo = $null)
 {
-    $retVal = ""
-
-    if ($DBFInfo.Type.hasMemoFile)
-    {
-        if ($DBFInfo.FileHandleOfMemo)
-        {
-            $FieldPos = $DBFInfo.Header.Fields | Where-Object {$_.Type -eq "M" -and $_.Name -eq $FieldName}
-            foreach ($fp in $FieldPos)
-            {                
-                if ($DBFInfo.Type.memoExt -eq "DBT")
-                {
-                    $retval = _Reset-MemofieldPointerDBT $DBFInfo $fp
-                }
-                else
-                {
-                    $retval = _Reset-MemofieldPointerFPT $DBFInfo $fp
-                }                   
-            }
-        }
-    }
-
-    $retVal
-
+    if (-not $DBFInfo.Type.hasMemoFile -or $DBFInfo.Type.memoExt -ne 'FPT') {
+        throw 'Raw memo pointer reset currently supports FPT memo files only.'
+     }
+    $MatchingFields = @($DBFInfo.Header.Fields | Where-Object { $_.Type -eq 'M' -and $_.Name -eq $FieldName })
+    if ($MatchingFields.Count -ne 1) { throw "Memo field '$FieldName' not found or ambiguous." }
+    _Reset-MemofieldPointerFPT $DBFInfo $MatchingFields[0] $RecNo
 }
 
-function _Reset-MemofieldPointerFPT ($DBFInfo, $FieldPos)
-{
-
-    $MemofieldSize = 10
-    [System.Byte[]]$MemoFieldBuffer = @(0x20) * $MemofieldSize
-    $RecordFieldPos = $DBFInfo.Header.DataOffset + ($DBFInfo.RecNo -1) * $DBFInfo.Header.RecordSize + $FieldPos.FieldPos +1
-    $Position = $DBFInfo.FilehandleOfDBF.Seek($RecordFieldPos, [System.IO.SeekOrigin]::Begin)    
-    $BytesRead = $DBFInfo.FilehandleOfDBF.Write($MemoFieldBuffer, 0, $MemofieldSize)
-
+# Repair operation: exactly the pointer bytes in the DBF, never the FPT.
+# 10-byte ASCII pointer -> 10 spaces (legacy behaviour).
+# 4-byte binary pointer -> 4 NUL bytes (zero block number).
+function _Reset-MemofieldPointerFPT ($DBFInfo, $FieldPos, $RecNo = $null) {
+    $DBF = $DBFInfo.FilehandleOfDBF
+    if ($DBFInfo.ReadOnly -or $null -eq $DBF -or -not $DBF.CanWrite) {
+        throw 'DBF opened read-only.'
+    }
+    if ($DBFInfo.Type.memoExt -ne 'FPT' -or $FieldPos.Type -ne 'M') {
+        throw 'This is not an FPT memo field.'
+    }
+    if (_HasPendingDBFChanges $DBFInfo) { throw 'Save or discard pending edits before resetting a memo pointer.' }
+    if ($null -eq $RecNo) { $RecNo = $DBFInfo.RecNo }
+    $Target = [long]$RecNo
+    if ($Target -lt 1 -or $Target -gt [long]$DBFInfo.Header.NumRecords) {
+        throw "Invalid DBF record number: $Target"
+    }
+    $Width = [int]$FieldPos.Length
+    if ($Width -notin @(4,10)) { throw "Unsupported FPT memo pointer width $Width." }
+    $Position = [long]$DBFInfo.Header.DataOffset +
+        ($Target - 1) * [long]$DBFInfo.Header.RecordSize +
+        1 + [long]$FieldPos.FieldPos
+    if ($Position -lt 0 -or $Position + $Width -gt $DBF.Length) {
+        throw "DBF record $Target is truncated."
+    }
+    [byte[]]$EmptyPointer = _MemoPointerBytes $FieldPos ([uint32]0)
+    [void]$DBF.Seek($Position, [IO.SeekOrigin]::Begin)
+    [byte[]]$Before = _ReadExactly $DBF $Width
+    $NeedsReset = $false
+    for ($I = 0; $I -lt $Width; $I++) {
+        if ($Before[$I] -ne $EmptyPointer[$I]) { $NeedsReset = $true; break }
+    }
+    if ($NeedsReset) {
+        [void]$DBF.Seek($Position, [IO.SeekOrigin]::Begin)
+        $DBF.Write($EmptyPointer, 0, $Width)
+        $DBF.Flush()
+    }
+    # Invalidate a cached record so later updates must reload from the DBF.
+    if ($DBFInfo.LoadedRecNo -eq $Target) {
+        $DBFInfo.LoadedRecNo = 0
+        $DBFInfo.OriginalRecord = $null
+        $DBFInfo.OriginalValues.Clear()
+        $DBFInfo.Fields[$FieldPos.Name] = ''
+    }
 }
 
 
