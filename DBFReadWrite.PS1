@@ -561,119 +561,400 @@ Function _NewDBFObject {
     $DBFObject
 }
 
-# create new field definition
-Function New-Field {
-	[CmdletBinding()]
-	Param (
-        [String]$Name,
-        [Validateset('Character', 'Logical', 'Numeric', 'Memo', 'Date')]
-        [String]$Type,
-        [int]$Length,
-        [int]$Decimal
-	)
-
-	[PSCustomObject]@{
-                        PSTypeName = "PSDBF.Field";
-                        Name = $Name;
-                        Type = $Type;
-                        Length = $Length;
-                        Decimal = $Decimal;
-					 }
-}
-
-# opens a DBF-file with active record pattern
-function New-DBF () {
+function New-Field {
     [CmdletBinding()]
-    Param( 
-        [Parameter(Mandatory=$true,
-                   ValueFromPipeline=$true,
-                   HelpMessage="Provide DBF-filename")]
-        [string]$DBFFilename,
-        [Parameter(Mandatory=$true,
-        HelpMessage="DBF-fields structure")]
-        [PSTypeName('PSDBF.Field')]
-        $Fields
+    param(
+        [Parameter(Mandatory=$true)]
+        [string]$Name,
+
+        [Parameter(Mandatory=$true)]
+        [ValidateSet(
+            'C','N','F','D','L','M',
+            'Character','Numeric','Float',
+            'Date','Logical','Memo'
+        )]
+        [string]$Type,
+
+        [int]$Length = 0,
+        [int]$Decimal = 0
     )
 
-    $ReadWrite = $true
+    if ($Name -cnotmatch '^[A-Za-z_][A-Za-z0-9_]{0,9}$') {
+        throw "Invalid DBF field name: '$Name'. Maximum 10 ASCII characters."
+    }
 
-    $DBFInfo = New-Object PSObject
-    _AddPropertiesAndMethods $DBFInfo
+    $Aliases = @{
+        Character = 'C'
+        Numeric   = 'N'
+        Float     = 'F'
+        Date      = 'D'
+        Logical   = 'L'
+        Memo      = 'M'
+    }
 
-    $hasMemofield = $false
-    foreach ($field in $Fields)
-    {
-        # set default values depending on type of field
-        switch ($field.type) {
-            'C' {$DBFInfo.Fields[$field.Name] = ""}
-            'D' {$DBFInfo.Fields[$field.Name] = (Get-Date).Date}
-            'L' {$DBFInfo.Fields[$field.Name] = $false}
-            'M' {$DBFInfo.Fields[$field.Name] = ""; $hasMemofield = $true}
-            'D' {$DBFInfo.Fields[$field.Name] = 0}
+    $Code = $Type.ToUpperInvariant()
+    if ($Aliases.ContainsKey($Type)) {
+        $Code = $Aliases[$Type]
+    }
+
+    if (-not $PSBoundParameters.ContainsKey('Length')) {
+        switch ($Code) {
+            'C' { $Length = 10 }
+            'N' { $Length = 10 }
+            'F' { $Length = 12 }
+            'D' { $Length = 8 }
+            'L' { $Length = 1 }
+            'M' { $Length = 10 }
         }
     }
 
-    $DBFInfo.FilehandleOfDBF = [System.IO.File]::Open($DBFFilename,
-                                            [System.IO.FileMode]::CreateNew,
-                                            [System.IO.FileAccess]::ReadWrite,
-                                            [System.IO.FileShare]::ReadWrite)
-
-    # writing DBF-Header
-    If ($hasMemofield) {
-        # TODO: support DBT!
-        $DbfHeaderByte = 245
-    } else {
-        $DbfHeaderByte = 3
-    }
-    $DBFInfo.FileHandleOfDBF.WriteByte($DbfHeaderByte)
-
-    $DBFObject = _NewDBFObject -DBFType $DbfHeaderByte
-
-    # writing number of fields
-    
-    # calculating number of fields, 32 bytes header, 2 bytes end of data and 32 bytes per field definition
-    $DBFStructure.NumFields = ($DBFStructure.DataOffset - 32 -2) / 32
-    
-    # reading field defintions
-    $Position = $DBFFileHandle.Seek(32, [System.IO.SeekOrigin]::Begin)    
-    $FNr = 1
-    $Encode = [System.Text.Encoding]::GetEncoding(850)
-    $FieldPos = 0
-    while($FNr -le $DBFStructure.NumFields)
-    {
-        $NumTemp = @(0x00) * 32
-        # reading field structure, per field 32bytes
-        $BytesRead = $DBFFileHandle.Read($NumTemp, 0, 32)   
-        $DBFFieldDef = New-Object PSObject
-        $DBFFieldDef | Add-Member -Type NoteProperty -Name Nr -Value 1
-        $DBFFieldDef | Add-Member -Type NoteProperty -Name Name -Value "Name"
-        $DBFFieldDef | Add-Member -Type NoteProperty -Name Type -Value "C"
-        $DBFFieldDef | Add-Member -Type NoteProperty -Name Length -Value 0
-        $DBFFieldDef | Add-Member -Type NoteProperty -Name Decimal -Value 0
-        $DBFFieldDef | Add-Member -Type NoteProperty -Name FieldPos -Value 0
-        $DBFFieldDef.Nr = $FNr
-        $DBFFieldDef.Name = $Encode.GetString($NumTemp[0..9]).TrimEnd(0)
-        $DBFFieldDef.Type = $Encode.GetString($NumTemp[11])
-        $DBFFieldDef.FieldPos = $FieldPos
-        if ($DBFFieldDef.Type -eq "C")
-        {
-            # Clipper + FoxPro special case
-            $DBFFieldDef.Length = $NumTemp[16] + $NumTemp[17] * 256
-            $DBFFieldDef.Decimal = 0
-        }
-        else
-        {
-            $DBFFieldDef.Length = $NumTemp[16]
-            $DBFFieldDef.Decimal = $NumTemp[17]
-        }
-        $FieldPos += $DBFFieldDef.Length
-        $FNr++
-        $DBFStructure.Fields += $DBFFieldDef
+    if ($Decimal -lt 0) {
+        throw "Negative decimal count in field '$Name'."
     }
 
+    switch ($Code) {
+        'C' {
+            if ($Length -lt 1 -or $Length -gt 65534 -or $Decimal -ne 0) {
+                throw "Character field '$Name': length 1..65534, decimals 0."
+            }
+        }
 
-    $DBFInfo
+        { $_ -in @('N','F') } {
+            if ($Length -lt 1 -or $Length -gt 20 -or
+                ($Decimal -gt 0 -and
+                ($Decimal -gt 18 -or $Length -lt $Decimal + 2))) {
+                throw "Numeric field '$Name': invalid length or decimals."
+            }
+        }
+
+        'D' {
+            if ($Length -ne 8 -or $Decimal -ne 0) {
+                throw "Date field '$Name' must have length 8."
+            }
+        }
+
+        'L' {
+            if ($Length -ne 1 -or $Decimal -ne 0) {
+                throw "Logical field '$Name' must have length 1."
+            }
+        }
+
+        'M' {
+            if ($Length -notin @(4,10) -or $Decimal -ne 0) {
+                throw "FPT memo field '$Name' requires length 4 or 10."
+            }
+        }
+    }
+
+    return [PSCustomObject]@{
+        PSTypeName = 'PSDBF.Field'
+        Name       = $Name
+        Type       = $Code
+        Length     = $Length
+        Decimal    = $Decimal
+    }
 }
+
+
+function New-DBFLanguageDriver {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory=$true)]
+        [int]$CodePage
+    )
+
+    switch ($CodePage) {
+        437  { return 0x01 }
+        850  { return 0x02 }
+        1252 { return 0x03 }
+        852  { return 0x64 }
+        866  { return 0x65 }
+        865  { return 0x66 }
+        861  { return 0x67 }
+        737  { return 0x6A }
+        857  { return 0x6B }
+        1250 { return 0xC8 }
+        1251 { return 0xC9 }
+        1254 { return 0xCA }
+        1253 { return 0xCB }
+
+        # UTF-8 und nicht eindeutig zugeordnete Codepages
+        default { return 0x00 }
+    }
+}
+
+
+function New-DBF {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory=$true, Position=0)]
+        [string]$DBFFilename,
+
+        [Parameter(Mandatory=$true)]
+        [object[]]$Fields,
+
+        [Parameter(Mandatory=$true)]
+        [ValidateRange(1,65535)]
+        [int]$CodePage,
+
+        [ValidateSet('Harbour')]
+        [string]$Format = 'Harbour',
+
+        [ValidateSet('FPT')]
+        [string]$MemoFormat = 'FPT',
+
+        [ValidateRange(8,65535)]
+        [int]$FPTBlockSize = 512
+    )
+
+    # Codepage validieren
+    $Encoding = _ResolveDBFEncoding $CodePage 0
+
+    if ($CodePage -ne 65001 -and -not $Encoding.IsSingleByte) {
+        throw "Codepage $CodePage is not supported for fixed-width DBF fields."
+    }
+
+    # FPT-Blockgröße prüfen
+    if ($FPTBlockSize -band ($FPTBlockSize - 1)) {
+        throw 'FPTBlockSize must be a power of two.'
+    }
+
+    if ($null -eq $Fields -or
+        $Fields.Count -lt 1 -or
+        $Fields.Count -gt 255) {
+        throw 'Supply between 1 and 255 field definitions.'
+    }
+
+    # Felddefinitionen normalisieren und prüfen
+    $Normalized = @()
+    $Names = @{}
+    [long]$RecordLength = 1
+
+    foreach ($Field in $Fields) {
+        if ($null -eq $Field -or
+            $null -eq $Field.PSObject.Properties['Name'] -or
+            $null -eq $Field.PSObject.Properties['Type'] -or
+            $null -eq $Field.PSObject.Properties['Length'] -or
+            $null -eq $Field.PSObject.Properties['Decimal']) {
+            throw 'Invalid field definition.'
+        }
+
+        $Spec = New-Field `
+            -Name ([string]$Field.Name) `
+            -Type ([string]$Field.Type) `
+            -Length ([int]$Field.Length) `
+            -Decimal ([int]$Field.Decimal)
+
+        if ($Names.ContainsKey($Spec.Name)) {
+            throw "Duplicate field name: '$($Spec.Name)'."
+        }
+
+        $Names[$Spec.Name] = $true
+        $Normalized += $Spec
+        $RecordLength += $Spec.Length
+    }
+
+    if ($RecordLength -gt 65535) {
+        throw 'DBF record length exceeds 65535 bytes.'
+    }
+
+    $HasMemo = @(
+        $Normalized | Where-Object { $_.Type -eq 'M' }
+    ).Count -gt 0
+
+    # DBF-Header: 32 Bytes Basisheader,
+    # 32 Bytes je Feld, 1 Byte Terminator
+    $HeaderLength = 32 + 32 * $Normalized.Count + 1
+
+    $Today = (Get-Date).Date
+
+    if ($Today.Year -lt 1900 -or $Today.Year -gt 2155) {
+        throw 'Date outside classic DBF header range.'
+    }
+
+    $FullName = [IO.Path]::GetFullPath($DBFFilename)
+    $FPTName = [IO.Path]::ChangeExtension($FullName, '.FPT')
+
+    if ([IO.File]::Exists($FullName)) {
+        throw "DBF already exists: $FullName"
+    }
+
+    if ($HasMemo -and [IO.File]::Exists($FPTName)) {
+        throw "FPT already exists: $FPTName"
+    }
+
+    $DBFStream = $null
+    $FPTStream = $null
+    $CreatedDBF = $false
+    $CreatedFPT = $false
+
+    try {
+        # DBF-Datei erstellen
+        $DBFStream = [IO.File]::Open(
+            $FullName,
+            [IO.FileMode]::CreateNew,
+            [IO.FileAccess]::ReadWrite,
+            [IO.FileShare]::None
+        )
+        $CreatedDBF = $true
+
+        # 32-Byte-DBF-Header
+        [byte[]]$Header = New-Object byte[] 32
+
+        if ($HasMemo) {
+            $Header[0] = 0xF5
+        } else {
+            $Header[0] = 0x03
+        }
+
+        $Header[1] = [byte]($Today.Year - 1900)
+        $Header[2] = [byte]$Today.Month
+        $Header[3] = [byte]$Today.Day
+
+        # Datensatzanzahl bleibt zunächst 0
+
+        [byte[]]$HL = [BitConverter]::GetBytes(
+            [uint16]$HeaderLength
+        )
+        [byte[]]$RL = [BitConverter]::GetBytes(
+            [uint16]$RecordLength
+        )
+
+        if (-not [BitConverter]::IsLittleEndian) {
+            [Array]::Reverse($HL)
+            [Array]::Reverse($RL)
+        }
+
+        [Array]::Copy($HL, 0, $Header, 8, 2)
+        [Array]::Copy($RL, 0, $Header, 10, 2)
+
+        $Header[29] = [byte](
+            New-DBFLanguageDriver -CodePage $CodePage
+        )
+
+        $DBFStream.Write($Header, 0, $Header.Length)
+
+        # Felddefinitionen schreiben
+        [long]$Offset = 1
+
+        foreach ($Field in $Normalized) {
+            [byte[]]$Descriptor = New-Object byte[] 32
+
+            [byte[]]$NameBytes =
+                [Text.Encoding]::ASCII.GetBytes($Field.Name)
+
+            [Array]::Copy(
+                $NameBytes, 0,
+                $Descriptor, 0,
+                $NameBytes.Length
+            )
+
+            # Feldtyp
+            $Descriptor[11] = [byte][char]$Field.Type
+
+            # Feldposition
+            [byte[]]$FieldOffset = _UInt32BytesLE (
+                [uint32]$Offset
+            )
+
+            [Array]::Copy(
+                $FieldOffset, 0,
+                $Descriptor, 12, 4
+            )
+
+            # Länge / Dezimalstellen
+            $Descriptor[16] = [byte]($Field.Length -band 255)
+
+            if ($Field.Type -eq 'C') {
+                $Descriptor[17] = [byte](
+                    ($Field.Length -shr 8) -band 255
+                )
+            } else {
+                $Descriptor[17] = [byte]$Field.Decimal
+            }
+
+            $DBFStream.Write(
+                $Descriptor, 0, $Descriptor.Length
+            )
+
+            $Offset += $Field.Length
+        }
+
+        # Headerende und EOF
+        $DBFStream.WriteByte(0x0D)
+        $DBFStream.WriteByte(0x1A)
+
+        $DBFStream.Flush()
+        $DBFStream.Dispose()
+        $DBFStream = $null
+
+        # FPT erzeugen, falls Memofelder vorhanden
+        if ($HasMemo) {
+            $FPTStream = [IO.File]::Open(
+                $FPTName,
+                [IO.FileMode]::CreateNew,
+                [IO.FileAccess]::ReadWrite,
+                [IO.FileShare]::None
+            )
+            $CreatedFPT = $true
+
+            [byte[]]$FPTHeader = New-Object byte[] 512
+
+            $FirstFreeBlock = [uint32][Math]::Ceiling(
+                512.0 / $FPTBlockSize
+            )
+
+            # NextFreeBlock: Big Endian
+            [byte[]]$NextBytes = _UInt32BytesBE $FirstFreeBlock
+
+            [Array]::Copy(
+                $NextBytes, 0,
+                $FPTHeader, 0, 4
+            )
+
+            # Blockgröße: Big Endian
+            $FPTHeader[6] = [byte](
+                ($FPTBlockSize -shr 8) -band 255
+            )
+            $FPTHeader[7] = [byte](
+                $FPTBlockSize -band 255
+            )
+
+            $FPTStream.Write(
+                $FPTHeader, 0, $FPTHeader.Length
+            )
+
+            $FPTStream.Flush()
+            $FPTStream.Dispose()
+            $FPTStream = $null
+        }
+
+        # Fertige Datei über bestehende API öffnen
+        return (Use-DBF -DBFFilename $FullName `
+                        -ReadWrite -CodePage $CodePage)
+    }
+    catch {
+        if ($null -ne $FPTStream) {
+            $FPTStream.Dispose()
+        }
+        if ($null -ne $DBFStream) {
+            $DBFStream.Dispose()
+        }
+
+        # Nur Dateien entfernen, die hier erstellt wurden
+        if ($CreatedFPT) {
+            Remove-Item -LiteralPath $FPTName -Force `
+                -ErrorAction SilentlyContinue
+        }
+        if ($CreatedDBF) {
+            Remove-Item -LiteralPath $FullName -Force `
+                -ErrorAction SilentlyContinue
+        }
+
+        throw
+    }
+}
+
 
 # Standalone ZAP
 function Zap_DBF () {
